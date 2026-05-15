@@ -80,15 +80,20 @@ After a few weeks, your agent instance will have a skill tree no one else in the
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
-# 2. Install dependencies
-pip install requests streamlit pywebview   # Desktop GUI (launch.pyw)
-pip install requests textual               # Terminal UI (tuiapp.py)
+# 2. Ensure Python version (3.10+)
+python --version  # requires Python >=3.10, <3.14
 
-# 3. Configure API Key
+# 3. Install core dependencies
+pip install -e "."
+pip install streamlit pywebview   # Desktop GUI (可选)
+pip install textual               # Terminal UI (可选)
+
+# 4. Configure API Key
 cp mykey_template.py mykey.py
+# Or use interactive wizard: python assets/configure_mykey.py
 # Edit mykey.py and fill in your LLM API Key
 
-# 4. Launch
+# 5. Launch
 python launch.pyw
 ```
 
@@ -97,11 +102,23 @@ python launch.pyw
 If you prefer a modern Python workflow, GenericAgent also provides a minimal `pyproject.toml`:
 
 ```bash
+# 1. Clone the repo
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
+
+# 2. Ensure Python version (3.10+)
+python --version  # requires Python >=3.10, <3.14
+
+# 3. Install with uv
 uv venv
 uv pip install -e ".[ui]"        # Core + GUI dependencies
+
+# 4. Configure API Key
 cp mykey_template.py mykey.py
+# Or use interactive wizard: python assets/configure_mykey.py
+# Edit mykey.py, fill in your LLM API Key
+
+# 5. Launch
 python launch.pyw
 ```
 
@@ -124,7 +141,8 @@ python frontends/tuiapp.py
 ### Other Desktop Frontends
 
 ```bash
-python frontends/qtapp.py                # Qt-based desktop app
+python frontends/qtapp.py                # Qt-based desktop app (requires PyQt5/PyQt6)
+pip install PyQt5                        # Install Qt dependency if needed
 streamlit run frontends/stapp2.py        # Alternative Streamlit UI
 ```
 
@@ -352,16 +370,20 @@ MIT License — see [LICENSE](LICENSE)
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
-# 2. 安装依赖
-pip install requests streamlit pywebview   # 桌面 GUI (launch.pyw)
-pip install requests textual               # 终端 UI (tuiapp.py)
+# 2. 确认 Python 版本（3.10+）
+python --version  # 需要 Python >=3.10, <3.14
 
-# 3. 配置 API Key
+# 3. 安装核心依赖
+pip install -e "."
+pip install streamlit pywebview   # 桌面 GUI (可选)
+pip install textual               # 终端 UI (可选)
+
+# 4. 配置 API Key
 cp mykey_template.py mykey.py
-# 编辑 mykey.py，填入你的 LLM API Key
 # 或使用交互式向导：python assets/configure_mykey.py
+# 编辑 mykey.py，填入你的 LLM API Key
 
-# 4. 启动
+# 5. 启动
 python launch.pyw
 ```
 
@@ -370,10 +392,23 @@ python launch.pyw
 如果你习惯现代 Python 工作流，GenericAgent 也提供了一个最小化的 `pyproject.toml`：
 
 ```bash
+# 1. 克隆仓库
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
+
+# 2. 确认 Python 版本（3.10+）
+python --version  # 需要 Python >=3.10, <3.14
+
+# 3. 使用 uv 安装
+uv venv
 uv pip install -e ".[ui]"        # 核心 + GUI 依赖
+
+# 4. 配置 API Key
 cp mykey_template.py mykey.py
+# 或使用交互式向导：python assets/configure_mykey.py
+# 编辑 mykey.py，填入你的 LLM API Key
+
+# 5. 启动
 python launch.pyw
 ```
 
@@ -400,7 +435,8 @@ python frontends/tuiapp.py
 ### 其他桌面前端
 
 ```bash
-python frontends/qtapp.py                # 基于 Qt 的桌面应用
+python frontends/qtapp.py                # 基于 Qt 的桌面应用（需 PyQt5/PyQt6）
+pip install PyQt5                        # 如需安装 Qt 依赖
 streamlit run frontends/stapp2.py        # 另一种 Streamlit 风格 UI
 ```
 

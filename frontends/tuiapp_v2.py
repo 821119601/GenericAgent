@@ -291,6 +291,7 @@ class InputArea(TextArea):
         pass
 
     def action_clear_input(self) -> None:
+        """Ctrl+U: 一键清空整个输入框（无视选区/光标位置），跨平台终端通用。"""
         self.reset()
         self._history_index = -1
         self._history_stash = ""
@@ -390,6 +391,7 @@ class InputArea(TextArea):
         self.app._suppress_palette_open = True
 
     def _history_up(self) -> bool:
+        """回到更旧的一条历史；到最旧时只吞掉按键。"""
         if not self._input_history:
             return False
         if self._history_index == -1:
@@ -642,6 +644,7 @@ def render_sidebar(sessions: dict[int, AgentSession], current_id: Optional[int])
 
 
 class HelpScreen(ModalScreen):
+    """快捷键帮助 modal：Esc / Ctrl+/ 关闭，不影响下层输入框位置。"""
     CSS = """
     HelpScreen { align: center middle; }
     HelpScreen > Static {
@@ -1252,6 +1255,7 @@ class GenericAgentTUI(App[None]):
         return None
 
     def _cancel_choice(self, msg: ChatMessage) -> None:
+        """Esc 取消选择：移除 choice 消息并同步当前 session，避免刷新后复现。"""
         for w in (msg._role_widget, msg._hint_widget, msg._body_widget):
             if w is not None:
                 try: w.remove()

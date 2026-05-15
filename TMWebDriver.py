@@ -1,3 +1,8 @@
+import sys, os
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_deps = os.path.join(_this_dir, 'deps') if os.path.basename(_this_dir) != 'deps' else _this_dir
+if _deps not in sys.path: sys.path.insert(0, _deps)
+
 import json, threading, time, uuid, queue, socket, requests, traceback
 from typing import Any
 from simple_websocket_server import WebSocketServer, WebSocket

@@ -118,3 +118,6 @@ reflect/*
 **/__pycache__/
 
 .claude/
+
+# Local cleanup backup scans (do not track bulky audit/cleanup snapshots)
+backup_to_clean/
