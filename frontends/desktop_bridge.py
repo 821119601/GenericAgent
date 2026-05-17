@@ -26,35 +26,17 @@ WS API:
 """
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import importlib
-import json
-import os
-import sys
-import threading
-import time
-import traceback
-import uuid
+import asyncio, contextlib, importlib, json, os, sys
+import threading, time, traceback, uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-
 from aiohttp import web, WSMsgType
 
 APP_DIR = Path(__file__).resolve().parent
 
 
 def find_default_ga_root() -> Path:
-    """Find GenericAgent root near this bridge.
-
-    Probe, in order:
-      ../
-      ../../
-      ../GenericAgent
-      ../../GenericAgent
-    and return the first directory containing agentmain.py.
-    """
     candidates = [
         APP_DIR / "..",
         APP_DIR / ".." / "..",
@@ -191,9 +173,9 @@ class AgentManager:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
             if self.active_session_id == sid:
                 self.active_session_id = next(iter(self.sessions), None)
-            if sess.agent and hasattr(sess.agent, "cancel"):
+            if sess.agent and hasattr(sess.agent, "abort"):
                 with contextlib.suppress(Exception):
-                    sess.agent.cancel()
+                    sess.agent.abort()
         emit_session_state(sess, "closed")
         return {"ok": True, "sessionId": sid}
 
@@ -229,8 +211,14 @@ class AgentManager:
             if hasattr(agent, "put_task"):
                 display_q = agent.put_task(prompt, images=images or [])
                 pieces = []
+                import queue as _queue
                 while True:
-                    item = display_q.get()
+                    if sess.cancel_requested:
+                        break
+                    try:
+                        item = display_q.get(timeout=1.0)
+                    except _queue.Empty:
+                        continue
                     if isinstance(item, dict):
                         if item.get("next"):
                             text = str(item["next"])
@@ -255,6 +243,15 @@ class AgentManager:
                 full = "GenericAgent object has no put_task/run method"
             if not full:
                 full = "(completed)"
+            if sess.cancel_requested:
+                with self.lock:
+                    sess.partial = None
+                    # Ensure status stays cancelled (don't overwrite)
+                    if sess.status != "cancelled":
+                        sess.status = "cancelled"
+                    sess.updated_at = time.time()
+                emit_session_state(sess, "cancelled")
+                return
             with self.lock:
                 sess.partial = None
                 # Strip trailing [Info] Final response to user. marker
@@ -298,9 +295,9 @@ class AgentManager:
             if not sess:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
             sess.cancel_requested = True
-            if sess.agent and hasattr(sess.agent, "cancel"):
+            if sess.agent and hasattr(sess.agent, "abort"):
                 with contextlib.suppress(Exception):
-                    sess.agent.cancel()
+                    sess.agent.abort()
             sess.status = "cancelled"
             sess.partial = None
             sess.updated_at = time.time()
