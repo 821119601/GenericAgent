@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from itertools import count
 from typing import Any, Callable, Optional
 
@@ -46,7 +47,9 @@ def _ensure_tui_deps() -> None:
 
 _ensure_tui_deps()
 try:
+    from rich import box
     from rich.markdown import Markdown
+    from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
     from textual import events
@@ -658,6 +661,12 @@ C_CHIP_MODEL  = _palette["chip_model"]
 C_CHIP_EFFORT = _palette["chip_effort"]
 C_CHIP_TASKS  = _palette["chip_tasks"]
 C_CHIP_TIME   = _palette["chip_time"]
+# Local custom constants (not theme-dependent)
+C_BORDER   = "#30363d"
+C_LINE     = "#2f3a45"
+C_SURFACE  = "#161b22"
+C_PANEL_BG = "#0f141b"
+C_ACCENT   = "#d2a8ff"
 
 
 def _hex_rgb(h: str) -> tuple[int, int, int]:
