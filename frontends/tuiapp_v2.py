@@ -765,6 +765,25 @@ def _palette_from_resolved_vars(v: dict[str, str], dark: bool) -> dict[str, str]
 _MAIN_CSS = """
 Screen { background: $ga-bg; color: $ga-fg; }
 
+#petbar {
+    dock: left;
+    width: 22;
+    height: 100%;
+    background: $surface;
+    border-right: tall $primary;
+    padding: 0 1;
+    overflow: hidden auto;
+}
+#rightbar {
+    dock: right;
+    width: 26;
+    height: 100%;
+    background: $surface;
+    border-left: tall $primary;
+    padding: 0 1;
+    overflow: hidden auto;
+}
+#rightbar.-hidden { display: none; }
 #topbar, #bottombar {
     height: 1;
     background: $ga-bg;
@@ -967,6 +986,7 @@ class AgentSession:
     # ask_user picker. The next user submission gets intercepted into a
     # 2-step `Ready to submit your answer?` confirmation.
     free_text_pending: Optional[dict] = None
+    token_estimate: int = 0
 
 
 def default_agent_factory() -> Any:
@@ -1012,6 +1032,7 @@ EDIT_ANSWER_CHOICE = "\x00__edit_answer__"
 class ChoiceList(OptionList):
     BINDINGS = [*OptionList.BINDINGS,
                 Binding("right", "select", "Select", show=False),
+        Binding("ctrl+r", "toggle_rightbar", "Toggle rightbar"),
                 Binding("escape", "cancel", "Cancel", show=False)]
 
     def __init__(self, msg: "ChatMessage", *options, **kwargs):
@@ -1548,9 +1569,251 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
     return t
 
 
-def render_bottombar(quit_armed: bool = False, rewind_armed: bool = False) -> Table:
+
+# ──── Local custom features (petbar / rightbar / token) ────
+
+def _session_history(sess: AgentSession) -> list[dict]:
+    try:
+        history = sess.agent.llmclient.backend.history
+        if isinstance(history, list):
+            return history
+    except Exception:
+        pass
+    return []
+
+def _clean_panel_line(text: str, *, strip_labels: tuple[str, ...] = ()) -> str:
+    """Normalize right-panel snippets; keep content readable, avoid duplicated labels."""
+    s = re.sub(r"\s+", " ", text.strip())
+    for label in strip_labels:
+        s = re.sub(rf"^\s*{re.escape(label)}\s*[:：]?\s*", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+def _session_context_label(sess: AgentSession) -> str:
+    turns = len(_session_history(sess))
+    if turns:
+        return f"历史 {turns} 条"
+    return f"显示 {len(sess.messages)} 条"
+
+def _estimate_tokens_for_session(sess: AgentSession) -> int:
+    total = 0
+    for m in _session_history(sess):
+        total += len(_history_text(m.get("content")))
+    if not total:
+        total = sum(len(m.content or "") for m in sess.messages)
+    return max(0, total // 4)
+
+def _today_summary(sessions: dict[int, AgentSession]) -> tuple[int, int, Optional[AgentSession], str]:
+    today = datetime.now().date()
+    touched = 0
+    running = 0
+    latest_sess: Optional[AgentSession] = None
+    latest_text = ""
+    for sess in sorted(sessions.values(), key=lambda s: s.created_at, reverse=True):
+        if datetime.fromtimestamp(sess.created_at).date() == today:
+            touched += 1
+        if sess.status == "running":
+            running += 1
+        if latest_sess is None:
+            latest_sess = sess
+            latest_text = _sidebar_last_summary(sess) or _sidebar_last_user(sess) or sess.name
+    return touched, running, latest_sess, latest_text
+
+def _cat_mood(sessions: dict[int, AgentSession]) -> tuple[str, str]:
+    if any(s.status == "running" for s in sessions.values()):
+        return "ฅ^•ﻌ•^ฅ", "盯着任务流..."
+    if any(s.status == "error" for s in sessions.values()):
+        return "=^._.^=", "需要摸摸排错"
+    return "=^_^=", "待命，随时出爪"
+
+def _session_needs_choice(sess: AgentSession) -> bool:
+    return any(
+        m.kind == "choice" and m.selected_label is None
+        for m in getattr(sess, "messages", [])
+    )
+
+def _panel(title: str, renderable, *, border_style: str = C_BORDER, padding: tuple[int, int] = (0, 1)) -> Panel:
+    # Soft panel treatment: information hierarchy without adding more boxes.
+    return Panel(
+        renderable,
+        title=Text(f" {title} ", style=f"bold {border_style}"),
+        title_align="left",
+        border_style=border_style,
+        box=box.ROUNDED,
+        padding=padding,
+    )
+
+def _format_session_rows(sessions: dict[int, AgentSession], current_id: Optional[int]) -> tuple[Table, dict[int, tuple[int, int]]]:
+    """Render clickable session rows and return row spans keyed by session id."""
+    SEL = f"on {C_SEL_BG}"
+    tbl = Table.grid(expand=True)
+    tbl.add_column(width=3)
+    tbl.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    tbl.add_column(width=8, justify="right")
+    row = 0
+    spans: dict[int, tuple[int, int]] = {}
+    for sid, sess in sessions.items():
+        start = row
+        active = sid == current_id
+        style = SEL if active else None
+        title = Text(_truncate(f"#{sid}  {sess.name}", 22), style=C_GREEN if active else C_FG)
+        marker = "▌" if active else " ·"
+        status_text = "run" if sess.status == "running" else sess.status[:7]
+        tbl.add_row(Text(marker, style=C_GREEN if active else C_DIM),
+                    title, Text(status_text, style=C_GREEN if sess.status == "running" else C_DIM),
+                    style=style)
+        row += 1
+        if (q := _sidebar_last_user(sess)):
+            tbl.add_row(Text(""), Text(_truncate(f"Q  {q}", 28), style=C_DIM), Text(""), style=style)
+            row += 1
+        if active and (s := _sidebar_last_summary(sess)):
+            tbl.add_row(Text(""), Text(_truncate(f"S  {s}", 28), style=C_MUTED), Text(""), style=style)
+            row += 1
+        spans[sid] = (start, row)
+        # Visual breathing room between agents; also counted by click hit-test.
+        tbl.add_row(Text(""), Text(""), Text(""))
+        row += 1
+    if not sessions:
+        tbl.add_row(Text("暂无会话", style=C_DIM), Text(""), Text(""))
+    return tbl, spans
+
+def _session_plan_lines(sess: AgentSession, model: str, limit: int = 5) -> list[str]:
+    lines = [
+        f"当前会话 #{sess.agent_id} · {sess.status}",
+        f"模型 { _truncate(model, 22) }",
+    ]
+    if sess.status == "running":
+        lines.append("正在执行：等待流式输出完成")
+    elif _session_needs_choice(sess):
+        lines.append("下一步：处理待选择项")
+    elif (last_user := _sidebar_last_user(sess)):
+        lines.append(f"下一步：围绕“{_truncate(last_user, 18)}”继续")
+    else:
+        lines.append("下一步：输入问题或 / 命令")
+    if sess.current_task_id is not None:
+        lines.append(f"task #{sess.current_task_id}")
+    return lines[:limit]
+
+def _session_todo_lines(sess: AgentSession, limit: int = 4) -> list[str]:
+    texts: list[str] = []
+    for m in reversed(_session_history(sess)):
+        text = _history_text(m.get("content"))
+        if text:
+            texts.append(text)
+        if len(texts) >= 10:
+            break
+    for m in reversed(sess.messages):
+        if m.content:
+            texts.append(m.content)
+        if len(texts) >= 14:
+            break
+    blob = "\n".join(reversed(texts))
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in blob.splitlines():
+        s = line.strip().lstrip("-•*[]0123456789.、 ")
+        if not s:
+            continue
+        low = s.lower()
+        if not any(k in low for k in ("todo", "待办", "下一步", "next", "[ ]")):
+            continue
+        s = _clean_panel_line(s, strip_labels=("todo", "待办", "下一步", "next", "[ ]"))
+        if not s or s in {"：", ":"}:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_truncate(s, 34))
+        if len(out) >= limit:
+            break
+    return out
+
+def _session_context_lines(sess: AgentSession, limit: int = 7) -> list[str]:
+    """Conversation summary / context / project background for the CONTEXT panel."""
+    lines: list[str] = []
+    if (summary := _sidebar_last_summary(sess)):
+        lines.append(f"总结：{_truncate(summary, 30)}")
+    if (last_user := _sidebar_last_user(sess)):
+        lines.append(f"当前问题：{_truncate(last_user, 28)}")
+    # Pick up recent system/background hints without duplicating the welcome line.
+    for m in reversed(_session_history(sess)):
+        if m.get("role") != "system":
+            continue
+        txt = _clean_panel_line(_history_text(m.get("content")), strip_labels=("背景", "context"))
+        if txt and "Welcome to GenericAgent" not in txt:
+            lines.append(f"背景：{_truncate(txt, 30)}")
+            break
+    lines.append(f"消息 {len(sess.messages)} 条 · token≈{sess.token_estimate:,}")
+    if sess.live_chars:
+        lines.append(f"流式输出 {sess.live_chars:,} 字")
+    if len(lines) == 1:
+        lines.insert(0, "暂无摘要；继续对话后自动提取")
+    return lines[:limit]
+
+def render_petbar(sessions: dict[int, AgentSession]) -> Table:
+    cat, mood = _cat_mood(sessions)
+    today_count, running, latest_sess, latest_text = _today_summary(sessions)
+    pet = Table.grid(expand=True)
+    pet.add_column(ratio=1)
+    pet.add_row(Text(cat, style=C_PURPLE))
+    pet.add_row(Text(mood, style=C_DIM))
+    status = Text()
+    status.append(f"今日 {today_count}", style=C_DIM)
+    if running:
+        status.append(f"  运行 {running}", style=C_GREEN)
+    elif latest_sess is not None:
+        status.append("  待命", style=C_DIM)
+    pet.add_row(status)
+    # Surface the highest-priority pending thing in the fixed lower-left corner.
+    active_pending = next((s for s in sessions.values() if _session_needs_choice(s)), None)
+    if active_pending is not None:
+        pet.add_row(Text(f"待决策：#{active_pending.agent_id} 需要选择", style=C_GREEN))
+    elif latest_sess is not None:
+        label = _truncate(latest_text or latest_sess.name, 18)
+        pet.add_row(Text(f"最近：#{latest_sess.agent_id} {_short_age(latest_sess.created_at)} {label}", style=C_DIM))
+    else:
+        pet.add_row(Text("按 / 唤起命令看板", style=C_DIM))
+    pet.add_row(Text("/ 命令看板 · Ctrl+N 新会话", style=C_MUTED))
+    outer = Table.grid(expand=True)
+    outer.add_column()
+    outer.add_row(_panel("STATUS", pet, border_style=C_PURPLE, padding=(0, 1)))
+    return outer
+
+def render_rightbar(sess: Optional[AgentSession], model: str = "?") -> Table:
+    outer = Table.grid(expand=True)
+    outer.add_column(ratio=1)
+    if sess is None:
+        empty = Text("暂无会话", style=C_DIM)
+        outer.add_row(_panel("NEXT", empty, border_style=C_GREEN, padding=(0, 1)))
+        outer.add_row(_panel("QUEUE", empty, border_style=C_BLUE, padding=(0, 1)))
+        outer.add_row(_panel("CONTEXT", empty, border_style=C_PURPLE, padding=(0, 1)))
+        return outer
+
+    plan_tbl = Table.grid(expand=True)
+    plan_tbl.add_column(ratio=1)
+    for line in _session_plan_lines(sess, model, limit=5):
+        plan_tbl.add_row(Text(line, style=C_DIM if line.startswith(("模型", "task")) else C_FG))
+
+    todo_tbl = Table.grid(expand=True)
+    todo_tbl.add_column(ratio=1)
+    for line in _session_todo_lines(sess, limit=5):
+        todo_tbl.add_row(Text(line, style=C_GREEN if line.startswith("待决策") else C_DIM))
+
+    ctx_tbl = Table.grid(expand=True)
+    ctx_tbl.add_column(ratio=1)
+    for line in _session_context_lines(sess, limit=6):
+        ctx_tbl.add_row(Text(line, style=C_DIM if line.startswith(("消息", "流式")) else C_FG))
+
+    outer.add_row(_panel("NEXT", plan_tbl, border_style=C_GREEN, padding=(0, 1)))
+    outer.add_row(_panel("QUEUE", todo_tbl, border_style=C_BLUE, padding=(0, 1)))
+    outer.add_row(_panel("CONTEXT", ctx_tbl, border_style=C_PURPLE, padding=(0, 1)))
+    return outer
+
+
+def render_bottombar(quit_armed: bool = False, rewind_armed: bool = False, token_estimate: int = 0) -> Table:
     t = Table.grid(expand=True)
     t.add_column(justify="left")
+    t.add_column(justify="right")
     left = Text()
     if quit_armed:
         left.append("再按 Ctrl+C 退出", style=f"bold {C_GREEN}")
@@ -1565,7 +1828,8 @@ def render_bottombar(quit_armed: bool = False, rewind_armed: bool = False) -> Ta
             left.append(k, style=C_GREEN if k in ("/", "Ctrl+/") else C_FG)
             left.append(" ")
             left.append(d, style=C_MUTED)
-    t.add_row(left)
+    right = Text(f"tokΣ {token_estimate:,}", style=C_DIM)
+    t.add_row(left, right)
     return t
 
 
@@ -1870,7 +2134,10 @@ class GenericAgentTUI(App[None]):
                 # with #body's 1fr. Content set at compose so the first frame
                 # already shows it.
                 yield Static(_tip_line(), id="tipbar")
-        yield Static(render_bottombar(), id="bottombar")
+        yield Static(render_petbar(self.sessions), id="petbar")
+        cur_sess = self.sessions.get(self.current_id) if self.current_id else None
+        yield Static(render_rightbar(cur_sess, model=getattr(cur_sess, "agent", None) and getattr(cur_sess.agent, "model_name", "?") or "?"), id="rightbar")
+        yield Static(render_bottombar(token_estimate=sum(s.token_estimate for s in self.sessions.values())), id="bottombar")
 
     def on_mount(self) -> None:
         self.add_session("main")
@@ -2116,6 +2383,18 @@ class GenericAgentTUI(App[None]):
         if self._resize_timer is not None:
             self._resize_timer.stop()
         self._resize_timer = self.set_timer(0.05, self._flush_resize)
+
+    def action_toggle_rightbar(self) -> None:
+        self.query_one("#rightbar", Static).toggle_class("-hidden")
+        for sess in self.sessions.values():
+            for m in sess.messages:
+                if m.role == "assistant":
+                    m._cached_body = None
+                    m._cache_key = ()
+        if self._resize_timer is not None:
+            self._resize_timer.stop()
+        self._resize_timer = self.set_timer(0.05, self._flush_resize)
+
 
     def action_toggle_fold(self) -> None:
         self.fold_mode = not self.fold_mode
@@ -3515,9 +3794,11 @@ class GenericAgentTUI(App[None]):
     def _refresh_bottombar(self):
         if not self.is_mounted: return
         try:
+            tokens = sum(s.token_estimate for s in self.sessions.values())
             self.query_one("#bottombar", Static).update(render_bottombar(
                 quit_armed=self._quit_armed,
                 rewind_armed=self._rewind_armed,
+                token_estimate=tokens,
             ))
         except Exception:
             pass
