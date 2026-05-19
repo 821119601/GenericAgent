@@ -361,7 +361,8 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
     for attempt in range(sess.max_retries + 1):
         streamed = False
         try:
-            with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
+            _req_sess = requests.Session(); _req_sess.trust_env = False
+            with _req_sess.post(url, headers=headers, json=payload, stream=sess.stream, 
                                timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
                 if r.status_code >= 400:
                     if r.status_code in _RETRYABLE and attempt < sess.max_retries:
@@ -522,7 +523,7 @@ class BaseSession:
         self.history = []; self.lock = threading.Lock(); self.system = ""
         self.name = cfg.get('name', self.model)
         proxy = cfg.get('proxy'); 
-        self.proxies = {"http": proxy, "https": proxy} if proxy else None
+        self.proxies = {"http": proxy, "https": proxy} if proxy else {"http": None, "https": None}
         self.max_retries = max(0, int(cfg.get('max_retries', 4)))
         self.verify = cfg.get('verify', True)
         self.stream = cfg.get('stream', True)
