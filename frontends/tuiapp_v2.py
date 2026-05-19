@@ -145,23 +145,26 @@ _TIPS = (
     "Tip: /export clip 把上一条回复复制到剪贴板；/export all 给出完整日志路径。",
     "Tip: /branch [name] 从当前历史分裂出新会话，互不污染。",
     "Tip: ask_user 题目里写 [多选] 自动切到 SelectionList；任何 picker 都有 \"Type something\" 走自由输入。",
-    "Tip: plan 模式下的 todo 会自动渲染到顶部的 📋 Plan 面板，全部完成后自动消失。",
+    "Tip: plan 模式下的 todo 会渲染在消息区与输入框之间的 📋 Plan 卡片，完成后自动消失。",
 )
 
 
-def _random_tip() -> str:
+def _random_tip(exclude: str = "") -> str:
+    """Pick a tip distinct from `exclude` so rotation doesn't repeat."""
     import random
-    return random.choice(_TIPS)
+    pool = [t for t in _TIPS if t != exclude] or list(_TIPS)
+    return random.choice(pool)
 
 
-def _tip_line():
-    """Render `└ Tip: …` as a styled Rich Text. Used directly in compose()
-    so the first paint already includes the line — no post-mount race."""
+def _tip_line(text: str = ""):
+    """`└ Tip: …` as styled Rich Text; empty `text` → blank pulse line."""
     from rich.text import Text as _T
     t = _T()
+    if not text:
+        return t
     t.append("└ ", style="#6e7681")
     t.append("Tip: ", style="bold #6e7681")
-    t.append(_random_tip().removeprefix("Tip: "), style="#6e7681")
+    t.append(text.removeprefix("Tip: "), style="#6e7681")
     return t
 
 # Defensive cleaners for ask_user candidates. The model occasionally smuggles
@@ -242,8 +245,9 @@ def fold_turns(text: str) -> list[dict]:
     def stash(m):
         placeholders.append(m.group(0))
         return f"\x00PH{len(placeholders) - 1}\x00"
-    safe = re.sub(r"`{4,}.*?`{4,}", stash, text, flags=re.DOTALL)
-    safe = re.sub(r"`{4,}[^`].*$", stash, safe, flags=re.DOTALL)
+    # Line-anchored so backticks embedded in tool output (e.g. `N|\`\`\`\``
+    # gutter from file_read) don't pair with later real fences.
+    safe = re.sub(r"^`{4,}.*?^`{4,}\n?", stash, text, flags=re.DOTALL | re.MULTILINE)
     parts = re.split(r"(\**LLM Running \(Turn \d+\) \.\.\.\**)", safe)
     parts = [re.sub(r"\x00PH(\d+)\x00", lambda m: placeholders[int(m.group(1))], p) for p in parts]
     if len(parts) < 4:
@@ -287,6 +291,40 @@ class HardBreakMarkdown(Markdown):
                 tok.type = "hardbreak"
             if tok.children:
                 HardBreakMarkdown._soft_to_hard(tok.children)
+
+
+# Rich's Markdown.TableElement adds columns without specifying `overflow`,
+# so Rich Table falls back to "ellipsis" — long cell contents get truncated
+# with `…` in narrow terminals. Patch to use "fold" instead so cells wrap
+# across multiple lines and full content stays visible.
+def _patch_markdown_table_overflow():
+    import rich.markdown as _rmd
+    from rich.table import Table as _RichTable
+    from rich import box as _rich_box
+
+    def _table_render(self, console, options):
+        table = _RichTable(
+            box=_rich_box.SIMPLE,
+            pad_edge=False,
+            style="markdown.table.border",
+            show_edge=True,
+            collapse_padding=True,
+        )
+        if self.header is not None and self.header.row is not None:
+            for column in self.header.row.cells:
+                heading = column.content.copy()
+                heading.stylize("markdown.table.header")
+                table.add_column(heading, overflow="fold")
+        if self.body is not None:
+            for row in self.body.rows:
+                row_content = [element.content for element in row.cells]
+                table.add_row(*row_content)
+        yield table
+
+    _rmd.TableElement.__rich_console__ = _table_render
+
+
+_patch_markdown_table_overflow()
 
 
 # Rich/Textual wrap treats a continuous CJK run as one indivisible word and
@@ -464,6 +502,19 @@ class _MdRender:
 _CENTER_LEAD_MIN = 4
 
 
+def _strip_quote_deco(s: str) -> tuple:
+    """Rich Markdown re-emits the `▌ ` blockquote marker on every wrapped visual
+    line in narrow, but the wide single-line render contains it only once at the
+    block start. Treat the re-prefix on continuation lines as visual indent that
+    doesn't consume wide chars. Returns (content_without_deco, deco_width)."""
+    if not s.startswith("▌"):  # `▌`
+        return s, 0
+    rest = s[1:]
+    if rest.startswith(" "):
+        return rest[1:], 2
+    return rest, 1
+
+
 def _align_md_renders(narrow_raw: str, wide_raw: str):
     """Walk narrow + wide line-by-line; return (source, line_starts, line_indents, line_lengths)."""
     narrow = [l.rstrip() for l in narrow_raw.split("\n")]
@@ -504,10 +555,17 @@ def _align_md_renders(narrow_raw: str, wide_raw: str):
                 is_last = (w_idx == W - 1)
                 while j < K and (accumulated < target or is_last):
                     nt = run_lines[j]
-                    content = nt.lstrip() if j > g_start - run_start else nt
+                    if j > g_start - run_start:
+                        content, _ = _strip_quote_deco(nt.lstrip())
+                    else:
+                        content = nt
                     accumulated += len(content)
                     j += 1
-                    if not is_last and accumulated >= target:
+                    # Each wrap boundary eats one space from the wide line, so
+                    # the narrow side's accumulated content runs (consumed - 1)
+                    # chars short of target at the natural wrap point.
+                    consumed = j - (g_start - run_start)
+                    if not is_last and accumulated + max(0, consumed - 1) >= target:
                         break
                 wrap_groups.append(((g_start, run_start + j), w_line))
 
@@ -548,7 +606,14 @@ def _align_md_renders(narrow_raw: str, wide_raw: str):
         nt0 = narrow[g_start]
         nt0_lead = len(nt0) - len(nt0.lstrip())
         wide_lead = len(wide_line) - len(wide_line.lstrip())
-        is_centered = (single_line and wide_lead > _CENTER_LEAD_MIN and nt0_lead > 0)
+        # Rich centers H1 against the available width, so wide_lead grows with the
+        # console width (≈ 5000 at width=10000) while nt0_lead reflects narrow's
+        # half-padding. Code lines, list/blockquote markers, etc. have wide_lead
+        # ≈ nt0_lead — without the >=2× guard the heuristic would strip indent
+        # from any code line with ≥5 leading spaces (e.g. `    print("hi")`),
+        # causing the visible selection and the copied text to disagree.
+        is_centered = (single_line and wide_lead > _CENTER_LEAD_MIN and nt0_lead > 0
+                       and wide_lead >= 2 * nt0_lead)
 
         if last_was_content:
             source_parts.append("\n")
@@ -573,6 +638,8 @@ def _align_md_renders(narrow_raw: str, wide_raw: str):
                 else:
                     indent = len(nt) - len(nt.lstrip())
                     content = nt.lstrip()
+                    content, deco = _strip_quote_deco(content)
+                    indent += deco
                     while pointer < len(wide_line) and wide_line[pointer].isspace():
                         pointer += 1
                 line_starts[k] = block_start + pointer
@@ -595,6 +662,7 @@ if FRONTENDS_DIR not in sys.path:
 import chatapp_common  # noqa: F401
 from chatapp_common import format_restore
 from btw_cmd import handle_frontend_command as btw_handle
+from review_cmd import handle as review_handle
 from continue_cmd import list_sessions as continue_list, extract_ui_messages as continue_extract
 from export_cmd import last_assistant_text, export_to_temp, wrap_for_clipboard
 
@@ -829,6 +897,20 @@ Screen { background: $ga-bg; color: $ga-fg; }
     scrollbar-color-active: $ga-dim;
 }
 
+/* Plan/todo panel — fixed 5-row card between messages and composer.
+   `display: none` default so the empty post-compose frame doesn't flash;
+   renderer flips it on once items materialize. Fixed height (no scroll)
+   keeps layout stable; body truncates to 4 items + "+N more" footer. */
+#planbar {
+    display: none;
+    height: 5;
+    max-height: 5;
+    background: $ga-sel-bg;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    border-left: thick $ga-green;
+}
+
 /* `└ Tip:` footer — one dim row, never grows. */
 #tipbar {
     height: 1;
@@ -952,16 +1034,14 @@ class ChatMessage:
     _segment_widgets: list = field(default_factory=list, repr=False)
     _segment_sig: tuple = field(default=(), repr=False)
     _spinner_widget: Any = field(default=None, repr=False)
-    # Wall-clock start of streaming for this assistant turn — drives the spinner's
-    # `(Xm Ys · ↑ N.Nk · gerund...)` annotation. Set on first stream chunk.
+    # Stream start + token baselines so the spinner shows *this turn's* deltas.
     _stream_started_at: Optional[float] = field(default=None, repr=False)
-    # Token snapshot captured at stream start so the spinner can show *this turn's*
-    # input cost rather than the lifetime cumulative.
     _stream_baseline_input: int = field(default=0, repr=False)
-    # Per-segment rendered-Text cache keyed by (seg_content_hash, width). Survives
-    # fold-toggle because toggling visibility doesn't mutate any segment's content,
-    # so re-rendering the same Markdown twice is wasted work — this turns a ~60ms
-    # remount into a <5ms widget-rebuild even on long multi-turn messages.
+    _stream_baseline_output: int = field(default=0, repr=False)
+    # Frozen `(elapsed, last_in, last_out)` at done→True; keeps the post-turn
+    # card from ticking when the next turn shifts cost_tracker deltas.
+    _done_summary: Optional[tuple] = field(default=None, repr=False)
+    # Per-(seg_hash, width) Text cache; survives fold-toggle re-mounts.
     _seg_render_cache: dict = field(default_factory=dict, repr=False)
 
 
@@ -982,20 +1062,23 @@ class AgentSession:
     input_pastes: dict[int, str] = field(default_factory=dict)
     input_paste_counter: int = 0
     buffer: str = ""
-    # Lazy-initialized in `_refresh_topbar` the first tick `status == "running"`
-    # is observed. Drives the topbar dot's heat-color ramp and the elapsed label.
+    # Drives topbar heat-color ramp + elapsed label; set on first running tick.
     _busy_since: Optional[float] = None
-    # When a run transitions running→idle we briefly flash the dot green; this
-    # holds the timestamp of that transition so the flash decays after ~5s.
+    # Stamps running→idle; topbar dot flashes green for ~5s after.
     _done_at: Optional[float] = None
-    # ask_user INTERRUPT events captured by the per-agent turn_end hook.
-    # Drained by the display thread when the assistant turn marks done.
+    # ask_user INTERRUPT events; drained by display thread on turn done.
     ask_user_events: Any = field(default_factory=lambda: queue.Queue())
-    # Set to {question: str} after user picks the free-text option in an
-    # ask_user picker. The next user submission gets intercepted into a
-    # 2-step `Ready to submit your answer?` confirmation.
+    # Pending `{question:str}` after the user picks free-text in an ask_user
+    # picker; next submission becomes a 2-step "Ready to submit?" confirm.
     free_text_pending: Optional[dict] = None
     token_estimate: int = 0
+    # Plan state: items + grace-period timers (3s farewell, 1.5s lost-grace).
+    plan_items: list = field(default_factory=list)
+    plan_complete_since: Optional[float] = None
+    plan_lost_since: Optional[float] = None
+    # Boundary between restored history (≤ idx) and this run (> idx);
+    # `/continue` bumps to `len(messages)` so old plan cards don't resurrect.
+    plan_scan_baseline: int = 0
 
 
 def default_agent_factory() -> Any:
@@ -1020,10 +1103,12 @@ COMMANDS = [
     ("/stop",     "",                 "中止当前任务"),
     ("/llm",      "[n]",              "查看 / 切换模型"),
     ("/btw",      "<question>",       "side question — 不打断主 agent"),
+    ("/review",   "[request]",         "in-session 代码审查（直接输出报告）"),
     ("/continue", "[n|name]",         "列出 / 恢复历史会话"),
     ("/cost",     "[all]",            "显示当前会话 token 用量（all = 所有会话）"),
     ("/export",   "clip|<file>|all",  "导出最后回复"),
     ("/restore",  "",                 "恢复上次模型响应日志"),
+    ("/reload-keys", "",              "重新加载 mykey.py（不重启）"),
     ("/quit",     "",                 "退出"),
 ]
 
@@ -1146,6 +1231,26 @@ class FoldHeader(SelectableStatic):
         super().__init__(body, **kwargs)
         self.msg = msg
         self.fold_idx = fold_idx
+
+
+# User-message display elision: pastes get expanded to full content before send
+# (agent needs the whole thing) but the user-visible message echo collapses the
+# middle so the chat log doesn't get buried under a 1000-line dump.
+_USER_DISPLAY_HEAD_LINES = 10
+_USER_DISPLAY_TAIL_LINES = 5
+_USER_DISPLAY_MAX_LINES = _USER_DISPLAY_HEAD_LINES + _USER_DISPLAY_TAIL_LINES + 4
+
+
+def _elide_user_display(text: str) -> str:
+    """Collapse middle of long user messages: keep head + tail, summarize gap."""
+    lines = text.split("\n")
+    n = len(lines)
+    if n <= _USER_DISPLAY_MAX_LINES:
+        return text
+    omitted = n - _USER_DISPLAY_HEAD_LINES - _USER_DISPLAY_TAIL_LINES
+    head = lines[:_USER_DISPLAY_HEAD_LINES]
+    tail = lines[-_USER_DISPLAY_TAIL_LINES:]
+    return "\n".join(head + [f"⋯ 省略 {omitted} 行 ⋯"] + tail)
 
 
 def _read_clipboard_text() -> str:
@@ -1392,8 +1497,28 @@ class InputArea(TextArea):
             return
         if self._paste_file_from_clipboard():
             event.stop(); event.prevent_default(); return
+        # Git-bash / mintty fallback: PIL.ImageGrab can't return Image objects
+        # in that TTY env, but the OS clipboard does hold the file path the
+        # screenshot tool wrote. Treat a single-line, on-disk path as if the
+        # file grab had succeeded — same placeholder + `_pastes` entry.
+        if self._paste_file_from_text(event.text):
+            event.stop(); event.prevent_default(); return
         self._insert_paste_text(event.text)
         event.stop(); event.prevent_default()
+
+    def _paste_file_from_text(self, raw: str) -> bool:
+        if not raw: return False
+        path = raw.strip().strip('"').strip("'")
+        if "\n" in path or "\r" in path: return False
+        if len(path) > 1024: return False
+        if not os.path.isfile(path): return False
+        is_image = os.path.splitext(path)[1].lower() in _IMAGE_EXTS
+        self._paste_counter += 1
+        sid = self._paste_counter
+        self._pastes[sid] = path
+        marker = f"[Image #{sid}]" if is_image else f"[File #{sid}]"
+        self._insert_via_keyboard(marker)
+        return True
 
     async def _on_key(self, event: events.Key) -> None:
         # 1) command palette routing
@@ -2072,6 +2197,10 @@ class GenericAgentTUI(App[None]):
         self.agent_factory: AgentFactory = agent_factory or default_agent_factory
         self.sessions: dict[int, AgentSession] = {}
         self.current_id: Optional[int] = None
+        # Wall-clock marker used by `/cost` to scope subagent log scans to
+        # logs touched after the TUI started — pre-launch leftovers shouldn't
+        # bleed into "this run's" total.
+        self._started_at: float = time.time()
         self._ids = count(1)
         self._suppress_palette_open = False
         self.fold_mode: bool = True
@@ -2107,17 +2236,22 @@ class GenericAgentTUI(App[None]):
             "rename": self._cmd_rename,
             "branch": self._cmd_branch, "rewind": self._cmd_rewind, "clear": self._cmd_clear,
             "stop": self._cmd_stop, "llm": self._cmd_llm, "export": self._cmd_export,
-            "restore": self._cmd_restore, "btw": self._cmd_btw, "continue": self._cmd_continue,
-            "cost": self._cmd_cost,
+            "restore": self._cmd_restore, "btw": self._cmd_btw, "review": self._cmd_review,
+            "continue": self._cmd_continue, "cost": self._cmd_cost,
+            "reload-keys": self._cmd_reload_keys,
             "quit": self._cmd_quit, "exit": self._cmd_quit,
         }
         try:
             import cost_tracker; cost_tracker.install()
         except Exception:
             pass
-        # Best-effort: drop session_names entries whose log was rotated away
-        # (e.g. month-old logs the user deleted). Keeps the registry tidy so
-        # `/continue <name>` never resolves to a vanished file.
+        # Patch GenericAgent for /review in case chatapp_common didn't wire it.
+        try:
+            from agentmain import GenericAgent as _GA
+            import review_cmd; review_cmd.install(_GA)
+        except Exception:
+            pass
+        # Drop session_names entries pointing at rotated-away logs.
         try:
             import session_names; session_names.gc()
         except Exception:
@@ -2129,6 +2263,7 @@ class GenericAgentTUI(App[None]):
             yield Static("", id="sidebar")
             with Vertical(id="main"):
                 yield VerticalScroll(id="messages")
+                yield Static("", id="planbar")
                 yield OptionList(id="palette")
                 yield InputArea(
                     "",
@@ -2142,7 +2277,7 @@ class GenericAgentTUI(App[None]):
                 # Tip line sits inside #main so it doesn't compete for height
                 # with #body's 1fr. Content set at compose so the first frame
                 # already shows it.
-                yield Static(_tip_line(), id="tipbar")
+                yield Static(_tip_line(_random_tip()), id="tipbar")
         yield Static(render_petbar(self.sessions), id="petbar")
         cur_sess = self.sessions.get(self.current_id) if self.current_id else None
         yield Static(render_rightbar(cur_sess, model=getattr(cur_sess, "agent", None) and getattr(cur_sess.agent, "model_name", "?") or "?"), id="rightbar")
@@ -2151,9 +2286,13 @@ class GenericAgentTUI(App[None]):
     def on_mount(self) -> None:
         self.add_session("main")
         self._system("Welcome to GenericAgent TUI. 按 / 唤起命令面板，Ctrl+N 新建会话。")
+        # CSS `#planbar { display: none }` keeps it hidden by default —
+        # the renderer flips it on once items materialize.
         self.query_one("#input", InputArea).focus()
         self.set_interval(0.5, self._tick)
         self._patch_auto_scroll_for_selection()
+        self._start_plan_watcher()
+        self._start_tip_rotator()
         self._apply_responsive_layout()
         # Disable alternate scroll mode (?1007). Textual enables ?1006 SGR mouse but doesn't
         # turn off ?1007, which on macOS Terminal / iTerm2 makes the wheel emit both mouse
@@ -2305,6 +2444,20 @@ class GenericAgentTUI(App[None]):
         i = ids.index(self.current_id)
         self.current_id = ids[(i + 1) % len(ids)]
         self._refresh_all()
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Override Textual's OSC 52 clipboard (broken on macOS Terminal.app).
+        Use pbcopy on macOS, fall back to OSC 52 on other platforms."""
+        import sys, subprocess as _sp
+        if sys.platform == "darwin":
+            try:
+                _sp.Popen(["pbcopy"], stdin=_sp.PIPE, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL).communicate(text.encode("utf-8"))
+                self._clipboard = text
+                return
+            except Exception:
+                pass
+        # Non-macOS or pbcopy failed: fall back to Textual default (OSC 52)
+        super().copy_to_clipboard(text)
 
     def action_handle_ctrl_c(self) -> None:
         # Two-stage quit: when no task is running, first press clears input and arms;
@@ -2577,6 +2730,19 @@ class GenericAgentTUI(App[None]):
         if palette.highlighted is not None:
             palette.action_select()
 
+    async def _on_paste(self, event: events.Paste) -> None:
+        # Windows Terminal yanks window focus when its large-paste-warning dialog
+        # pops, and the focus doesn't return to any specific widget after confirm.
+        # Without a focused widget Textual routes the Paste event to the App
+        # bubble — InputArea never sees it. Forward it back to the input box.
+        try:
+            inp = self.query_one("#input", InputArea)
+        except Exception:
+            return
+        inp.focus()
+        await inp._on_paste(event)
+        event.stop(); event.prevent_default()
+
     def on_click(self, event: events.Click) -> None:
         w = event.widget
         if isinstance(w, FoldHeader):
@@ -2654,6 +2820,17 @@ class GenericAgentTUI(App[None]):
             container = self.query_one("#messages", VerticalScroll)
         except Exception:
             return
+        # Preserve scroll position across remount. "Near the bottom" snaps to
+        # bottom afterwards so streaming output stays visible; mid-scroll keeps
+        # the same scroll_y so resize/sidebar-toggle don't yank the user away
+        # from what they're reading. 2-line tolerance covers rounding.
+        try:
+            was_at_bottom = (container.scroll_y + container.size.height
+                             >= container.virtual_size.height - 2)
+            prev_scroll_y = container.scroll_y
+        except Exception:
+            was_at_bottom = True
+            prev_scroll_y = 0
         container.remove_children()
         for m in self.current.messages:
             m._role_widget = None
@@ -2664,7 +2841,10 @@ class GenericAgentTUI(App[None]):
             m._spinner_widget = None
         for m in self.current.messages:
             self._mount_message(container, m)
-        container.scroll_end(animate=False)
+        if was_at_bottom:
+            container.scroll_end(animate=False)
+        else:
+            container.scroll_to(y=prev_scroll_y, animate=False)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "input":
@@ -2704,6 +2884,16 @@ class GenericAgentTUI(App[None]):
         self._resize_input(inp)
         if not text:
             return
+        # Pick up mykey.py edits without restart: load_llm_sessions() is a
+        # cheap mtime check when nothing changed; on change it rebuilds the
+        # llm clients in place, migrating history. Done per submit so a user
+        # who tweaks mykey then sends a message gets the new config.
+        try:
+            sess = self.sessions.get(self.current_id)
+            if sess is not None and hasattr(sess, "agent"):
+                sess.agent.load_llm_sessions()
+        except Exception:
+            pass
         if text.startswith("/"):
             parts = text.split(maxsplit=1)
             cmd = parts[0][1:].lower()
@@ -3066,6 +3256,30 @@ class GenericAgentTUI(App[None]):
             self._system(f"Stop failed: {e}")
         self._refresh_all()
 
+    def _cmd_reload_keys(self, args, raw):
+        # Force rebuild of every session's llmclients from a fresh mykey.py.
+        # reload_mykeys() uses a module-level mtime cache, so the first agent
+        # to call it consumes the "changed" signal and subsequent agents see
+        # changed=False (and skip rebuild). Invalidate the cache before each
+        # agent so every session picks up the new config.
+        try:
+            import llmcore
+        except Exception as e:
+            self._system(f"❌ 无法 import llmcore: {e}"); return
+        n_ok = n_fail = 0
+        for sess in self.sessions.values():
+            agent = getattr(sess, "agent", None)
+            if agent is None:
+                continue
+            try:
+                llmcore._mykey_mtime = None
+                agent.load_llm_sessions()
+                n_ok += 1
+            except Exception:
+                n_fail += 1
+        msg = f"🔑 已重载 mykey.py（{n_ok} 个会话）" + (f"，{n_fail} 个失败" if n_fail else "")
+        self._system(msg)
+
     def _cmd_llm(self, args, raw):
         sess = self.current
         if args:
@@ -3125,6 +3339,46 @@ class GenericAgentTUI(App[None]):
 
         threading.Thread(target=worker, daemon=True, name="ga-tui-btw").start()
 
+    def _cmd_review(self, args, raw):
+        """`/review` via TUI's streaming path; the TUI intercepts slash commands
+        before `review_cmd.install`'s patch, so we render the prompt via
+        `review_cmd.handle` and submit it as a normal task with `/review ...`
+        kept as the visible user message."""
+        body = (raw or "").strip()
+        if body == "/review":
+            body = ""
+        elif body.startswith("/review ") or body.startswith("/review\t"):
+            body = body[len("/review"):].strip()
+        else:
+            body = " ".join(args).strip()
+        sess = self.current
+        if body in ("help", "?", "-h", "--help"):
+            try:
+                dq = queue.Queue()
+                rendered = review_handle(sess.agent, body, dq)
+                try:
+                    item = dq.get_nowait()
+                    self._system(str(item.get("done") or ""))
+                except queue.Empty:
+                    if rendered:
+                        self._system(rendered)
+            except Exception as e:
+                self._system(f"❌ /review help 失败: {type(e).__name__}: {e}")
+            return
+        if sess.status == "running":
+            self._system(f"#{sess.agent_id} 正在跑，/stop 后再发。")
+            return
+        try:
+            prompt = review_handle(sess.agent, body, queue.Queue())
+        except Exception as e:
+            self._system(f"❌ /review 初始化失败: {type(e).__name__}: {e}")
+            return
+        if not prompt:
+            self._system("❌ /review 未生成审查提示。")
+            return
+        display_text = raw.strip() if (raw or "").strip() else "/review"
+        self.submit_user_message(prompt, display_text=display_text)
+
     def _cmd_continue(self, args, raw):
         sess = self.current
         m = re.match(r"/continue\s+(\S.*?)\s*$", (raw or "").strip())
@@ -3153,20 +3407,17 @@ class GenericAgentTUI(App[None]):
         sessions = continue_list(exclude_pid=os.getpid())
         if not sessions:
             self._system("❌ 没有可恢复的历史会话"); return
-        LIMIT = 20
         choices = []
         try:
             import session_names as _sn
         except Exception:
             _sn = None
-        for path, mtime, first, n in sessions[:LIMIT]:
+        for path, mtime, first, n in sessions:
             preview = (first or "（无法预览）").replace("\n", " ").strip()[:50]
             nm = _sn.name_for(path) if _sn else ""
             tag = f"{nm} · " if nm else ""
             choices.append((f"{_short_age(mtime)} · {tag}{n}轮 · {preview}", path))
-        head = "选择要恢复的会话 (↑/↓ 移动，→/Enter 确认，Esc 取消)"
-        if len(sessions) > LIMIT:
-            head += f"  [仅显示最近 {LIMIT}/{len(sessions)}]"
+        head = f"选择要恢复的会话 ({len(sessions)} 条 · ↑/↓ 移动，→/Enter 确认，Esc 取消)"
         msg = ChatMessage(
             role="system", content=head, kind="choice", choices=choices,
             on_select=lambda v: self._do_continue_restore(v),
@@ -3196,8 +3447,18 @@ class GenericAgentTUI(App[None]):
                 pass
         def _finish():
             sess.messages.clear()
+            # Plan state belongs to the *previous* conversation. Clearing it
+            # along with messages stops the planbar from leaking stale items
+            # (`Plan (3/7)` from #4 qxs) into the freshly-restored session.
+            sess.plan_items = []
+            sess.plan_complete_since = None
+            sess.plan_lost_since = None
+            self._plan_mtime.pop(sess.agent_id, None)
             for h in continue_extract(path):
                 sess.messages.append(ChatMessage(role=h["role"], content=h["content"]))
+            # Baseline past restored history so the scanner ignores the prior
+            # session's plan.md; only re-shows on a fresh enter_plan_mode.
+            sess.plan_scan_baseline = len(sess.messages)
             try:
                 import session_names
                 nm = session_names.name_for(path)
@@ -3254,21 +3515,43 @@ class GenericAgentTUI(App[None]):
                     f"{_k(t.cache_create)} created  ·  "
                     f"{t.cache_hit_rate():.1f}% hit"
                 )
-            ctx = cost_tracker.context_limit_for(model)
-            if ctx and t.last_input > 0:
-                used = t.last_input
-                pct_left = max(0.0, (ctx - used) / ctx * 100.0)
+            try: backend = sess.agent.llmclient.backend
+            except Exception: backend = None
+            cap = cost_tracker.context_window_chars(backend) if backend else 0
+            used = cost_tracker.current_input_chars(backend) if backend else 0
+            if cap > 0:
+                pct_left = max(0.0, (cap - used) / cap * 100.0)
                 ls.append(
                     f"  Context window:  {pct_left:>5.0f}% left  "
-                    f"({_k(used)} used / {_k(ctx)})"
+                    f"({_k(used)} chars used / {_k(cap)} cap)"
                 )
             ls.append(f"  Requests:        {t.requests:>7}")
+            return ls
+
+        # Scope subagent logs to this TUI run so prior-session logs don't bleed in.
+        try: sub = cost_tracker.scan_subagent_logs(since=getattr(self, "_started_at", 0.0))
+        except Exception: sub = None
+
+        def _sub_section() -> list[str]:
+            if not sub or sub.total_tokens() == 0: return []
+            ls = ["", f"subagents (扫描 temp/*/stdout.log)"]
+            ls.append(
+                f"  Token usage:     {_k(sub.total_tokens()):>7} total  "
+                f"({_k(sub.total_input_side())} input + {_k(sub.output)} output)"
+            )
+            if sub.cache_read or sub.cache_create:
+                ls.append(
+                    f"  Cache:           {_k(sub.cache_read):>7} read  ·  "
+                    f"{_k(sub.cache_create)} created  ·  "
+                    f"{sub.cache_hit_rate():.1f}% hit"
+                )
+            ls.append(f"  Requests:        {sub.requests:>7}")
             return ls
 
         lines: list[str] = []
         if show_all:
             trackers = cost_tracker.all_trackers()
-            if not trackers:
+            if not trackers and not (sub and sub.total_tokens()):
                 lines = ["✦ Token usage", "  (尚无任何 LLM 调用记录)"]
             else:
                 # Resolve each thread back to a session if we still know it; otherwise
@@ -3292,12 +3575,14 @@ class GenericAgentTUI(App[None]):
                             f"({_k(t.total_input_side())} input + {_k(t.output)} output)"
                         )
                         lines.append(f"  Requests:        {t.requests:>7}")
+                lines += _sub_section()
         else:
             sess = self.current
             tname = sess.thread.name if sess.thread else f"ga-tui-agent-{sess.agent_id}"
             t = cost_tracker.get(tname)
             lines.append("✦ Token usage")
             lines += _section(sess.agent_id, sess, t)
+            lines += _sub_section()
         self._system("\n".join(lines))
 
     def _cmd_export(self, args, raw):
@@ -3410,12 +3695,9 @@ class GenericAgentTUI(App[None]):
         self._reset_terminal_title()
 
     # ---------------- agent task + stream ----------------
-    def submit_user_message(self, text: str, images: Optional[list[str]] = None) -> int:
+    def submit_user_message(self, text: str, images: Optional[list[str]] = None, display_text: Optional[str] = None) -> int:
         sess = self.current
-        # Free-text ask_user interception: route through the 2-step
-        # `Ready to submit your answer?` confirmation card before letting
-        # the agent see the answer. Only triggers when the picker armed
-        # `sess.free_text_pending`; the rest of the submit path is unchanged.
+        # Free-text ask_user answers go through a 2-step submit-confirm card.
         if self._maybe_intercept_free_text(sess, text):
             return -1
         if sess.status == "running":
@@ -3427,7 +3709,8 @@ class GenericAgentTUI(App[None]):
         sess.buffer = ""
         sess.status = "running"
         image_paths = list(images or [])
-        sess.messages.append(ChatMessage("user", text, image_paths=image_paths))
+        visible_text = text if display_text is None else display_text
+        sess.messages.append(ChatMessage("user", visible_text, image_paths=image_paths))
         sess.messages.append(ChatMessage("assistant", "", task_id=tid, done=False))
         self._refresh_all()
         try:
@@ -3471,12 +3754,12 @@ class GenericAgentTUI(App[None]):
             s.status = "idle"
             s.current_display_queue = None
         self._update_assistant(agent_id, text, task_id=task_id, done=done, refresh_chrome=True)
+        # End-of-turn re-parse only; mid-stream `[...]` fragments would flash.
         if done:
+            self._update_plan_state(s, text)
             self._drain_ask_user_events(s)
 
-    # `[多选]` / `[multi]` / `select all` in the question switches the picker to
-    # a multi-select widget. The flag is intentionally heuristic so existing
-    # ask_user calls (no schema change in core) can opt in by phrasing alone.
+    # Phrasing-based opt-in for multi-select picker (no core schema change).
     _MULTI_RE = re.compile(r"\[?(?:多选|multi(?:[-_ ]?select)?|select all)\]?", re.IGNORECASE)
 
     def _drain_ask_user_events(self, sess: AgentSession) -> None:
@@ -3667,6 +3950,172 @@ class GenericAgentTUI(App[None]):
             self._refresh_topbar()
         self._ensure_spinner()
 
+    # ---------------- Plan/todo panel ----------------
+    # State machine (graces absorb mid-stream parse misses / let final tally read):
+    #   hidden → active(n_done/n_total) → complete(n/n) → [3s grace] → hidden
+    #   active/complete → empty → [1.5s grace] → hidden
+    _PLAN_GRACE_SEC = 3.0
+    _PLAN_LOST_GRACE_SEC = 1.5
+
+    def _update_plan_state(self, sess: AgentSession, _stream_text: str = "") -> None:
+        import plan_state
+        prev = sess.plan_items
+        # Detect plan mode: `working['in_plan_mode']` first, fallback to per-
+        # session message scan for a `plan_*/plan.md` reference. Strictly
+        # per-session via `plan_scan_baseline` to avoid /continue bleed.
+        new_items: list = []
+        msgs = sess.messages
+        base = sess.plan_scan_baseline
+        if plan_state.is_active(sess.agent, messages=msgs, start_idx=base):
+            path = plan_state.resolve_path(sess.agent, messages=msgs, start_idx=base)
+            if path:
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        new_items = plan_state.extract(f.read())
+                except OSError:
+                    new_items = []
+        now_c = plan_state.is_complete(new_items) and new_items
+        was_c = plan_state.is_complete(prev) and prev
+        if now_c and not was_c: sess.plan_complete_since = time.time()
+        elif not now_c:         sess.plan_complete_since = None
+        if not new_items and prev:
+            sess.plan_lost_since = time.time()
+        elif new_items:
+            sess.plan_lost_since = None
+            sess.plan_items = new_items
+        if sess.agent_id == self.current_id:
+            self._refresh_planbar()
+
+    def _refresh_planbar(self) -> None:
+        try: bar = self.query_one("#planbar", Static)
+        except Exception: return
+        sess = self.sessions.get(self.current_id) if self.current_id is not None else None
+        items = sess.plan_items if sess else []
+        if sess and sess.plan_lost_since is not None:
+            if time.time() - sess.plan_lost_since >= self._PLAN_LOST_GRACE_SEC:
+                sess.plan_items = []; sess.plan_lost_since = None; items = []
+        import plan_state
+        msgs = sess.messages if sess else None
+        base = sess.plan_scan_baseline if sess else 0
+        # Plan-mode armed but no items yet → placeholder (covers the
+        # enter_plan_mode → first plan.md write gap).
+        if not items:
+            if sess and plan_state.is_active(sess.agent, messages=msgs, start_idx=base):
+                self._render_planbar_placeholder(bar, sess)
+                return
+            self._set_planbar_visible(bar, False); return
+        n_done, n_total = plan_state.summary(items)
+        complete = plan_state.is_complete(items)
+        if complete and sess and sess.plan_complete_since is not None:
+            if time.time() - sess.plan_complete_since >= self._PLAN_GRACE_SEC:
+                self._set_planbar_visible(bar, False); return
+        # 5-row budget: header(1) + step(0/1) + tasks(N) + overflow(0/1).
+        step = plan_state.current_step(msgs, start_idx=base)
+        budget = 4 - (1 if step else 0)
+        ordered = [(c, st) for c, st in items if st != "done"] + \
+                  [(c, st) for c, st in items if st == "done"]
+        body_lines = budget - 1 if len(ordered) > budget else budget
+        shown = ordered[:body_lines]
+        overflow = max(0, len(ordered) - body_lines)
+        sig = (tuple(shown), overflow, step, bool(complete and sess and sess.plan_complete_since))
+        if getattr(bar, "_plan_sig", None) == sig and bar.display: return
+        bar._plan_sig = sig
+        body = Text()
+        head = f"✓ Plan complete ({n_total}/{n_total})\n" if complete else f"📋 Plan ({n_done}/{n_total})\n"
+        body.append(head, style=f"bold {C_GREEN}")
+        if step:
+            body.append("  ▸ ", style=C_GREEN)
+            body.append(step[:120] + "\n", style=C_MUTED)
+        for c, st in shown:
+            if st == "done": body.append("  ✔ ", style=C_GREEN); body.append(c + "\n", style=C_DIM)
+            else:            body.append("  ☐ ", style=C_DIM);  body.append(c + "\n", style=C_FG)
+        if overflow:
+            body.append(f"  ⋮ +{overflow} more", style=C_DIM)
+        bar.update(body)
+        self._set_planbar_visible(bar, True)
+
+    def _render_planbar_placeholder(self, bar: Static, sess: AgentSession) -> None:
+        # Placeholder for armed-but-empty plan mode (pre-first plan.md write).
+        import plan_state
+        base = sess.plan_scan_baseline
+        path = (plan_state._stashed_plan_path(sess.agent)
+                or plan_state.find_path_in_messages(sess.messages, start_idx=base)
+                or "")
+        hint = "/".join(path.replace("\\", "/").rstrip("/").split("/")[-2:]) if path else "plan.md"
+        step = plan_state.current_step(sess.messages, start_idx=base)
+        sig = ("__placeholder__", hint, step)
+        if getattr(bar, "_plan_sig", None) == sig and bar.display: return
+        bar._plan_sig = sig
+        body = Text()
+        body.append("📋 Plan 模式已激活\n", style=f"bold {C_GREEN}")
+        if step:
+            body.append("  ▸ ", style=C_GREEN)
+            body.append(step[:120] + "\n", style=C_MUTED)
+        body.append(f"  等待写入 {hint} …", style=C_DIM)
+        bar.update(body)
+        self._set_planbar_visible(bar, True)
+
+    def _set_planbar_visible(self, bar: Static, visible: bool) -> None:
+        # Repaint only on show→hide transition; idle ticks no-op.
+        if not visible:
+            if not bar.display: return
+            bar.display = False
+            bar.update(Text())
+            bar._plan_sig = None
+            return
+        if not bar.display: bar.display = True
+
+    def _start_plan_watcher(self) -> None:
+        if getattr(self, "_plan_timer", None) is not None: return
+        self._plan_mtime: dict = {}
+        try: self._plan_timer = self.set_interval(1.0, self._poll_plan_files)
+        except Exception: pass
+
+    def _poll_plan_files(self) -> None:
+        # Poll only the visible session — background sessions don't paint planbar.
+        import plan_state
+        sess = self.sessions.get(self.current_id) if self.current_id is not None else None
+        if sess is None: return
+        msgs = sess.messages
+        base = sess.plan_scan_baseline
+        if not plan_state.is_active(sess.agent, messages=msgs, start_idx=base):
+            self._refresh_planbar(); return
+        path = plan_state.resolve_path(sess.agent, messages=msgs, start_idx=base)
+        if not path:
+            self._refresh_planbar(); return
+        try: mtime = os.path.getmtime(path)
+        except OSError:
+            self._refresh_planbar(); return
+        if self._plan_mtime.get(sess.agent_id) != mtime:
+            self._plan_mtime[sess.agent_id] = mtime
+            self._update_plan_state(sess); return
+        self._refresh_planbar()  # tick grace timers
+
+    # ---------------- Tip rotation ----------------
+    # 12s show → 1s blank → next tip.
+    _TIP_SHOW_SEC = 12.0
+    _TIP_BLANK_SEC = 1.0
+
+    def _start_tip_rotator(self) -> None:
+        if getattr(self, "_tip_timer", None) is not None: return
+        self._tip_current: str = ""
+        try: self._tip_timer = self.set_interval(self._TIP_SHOW_SEC, self._rotate_tip)
+        except Exception: pass
+
+    def _rotate_tip(self) -> None:
+        try: bar = self.query_one("#tipbar", Static)
+        except Exception: return
+        bar.update(_tip_line(""))  # blank pulse
+        nxt = _random_tip(exclude=self._tip_current)
+        self._tip_current = nxt
+        try: self.set_timer(self._TIP_BLANK_SEC, lambda: self._show_tip(nxt))
+        except Exception: self._show_tip(nxt)
+
+    def _show_tip(self, tip: str) -> None:
+        try: bar = self.query_one("#tipbar", Static)
+        except Exception: return
+        bar.update(_tip_line(tip))
+
     # ---------------- UI refresh ----------------
     def _system(self, text: str) -> None:
         if self.current_id is None: return
@@ -3679,6 +4128,7 @@ class GenericAgentTUI(App[None]):
         self._refresh_topbar()
         self._refresh_sidebar()
         self._refresh_messages()
+        self._refresh_planbar()
         self._ensure_spinner()
 
     def _swap_input_for_session(self) -> None:
@@ -3931,11 +4381,13 @@ class GenericAgentTUI(App[None]):
             else:
                 content = _TURN_MARKER_RE.sub("", seg.get("content", ""), count=1)
                 # While streaming, the tail text segment grows every chunk — Markdown
-                # parsing it per chunk is the streaming-lag root cause. Render as plain
-                # Text during streaming; _stream_update_assistant swaps in the real
-                # Markdown render once m.done flips True.
+                # parsing it per chunk is the streaming-lag root cause. Render via
+                # Text.from_ansi during streaming (O(n) scan, no reflow) so SGR codes
+                # in the chunk become styles instead of literal `[31m` glyphs;
+                # _stream_update_assistant swaps in the real Markdown render once
+                # m.done flips True.
                 if i == last_i and not m.done:
-                    out.append(("text", Text(content, style=C_FG), None))
+                    out.append(("text", Text.from_ansi(content, style=C_FG), None))
                 else:
                     out.append(("text", cached_render(content), None))
         if m.done:
@@ -3945,23 +4397,23 @@ class GenericAgentTUI(App[None]):
 
     _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-    # Easter-egg gerunds rotated through the spinner annotation — keeps the
-    # streaming wait feeling alive rather than dead-frozen.
+    # Spinner gerund pool (stable per-message via id-hash; separate from _DONE_GERUNDS).
     _SPINNER_GERUNDS = (
         "Pondering", "Reticulating", "Sleuthing", "Hatching", "Pouncing",
         "Brewing", "Sharpening", "Untangling", "Compiling", "Unraveling",
         "Distilling", "Calibrating", "Marinating", "Conjuring", "Foraging",
         "Spelunking", "Synthesizing", "Refactoring thoughts", "Tracing breadcrumbs",
         "Following the rabbit hole",
+        "Routing", "Threading", "Polling", "Spinning", "Hooking",
+        "Patching", "Caching", "Yielding", "Hydrating", "Folding",
+        "Streaming", "Resolving", "Reaping", "Tuning",
     )
 
     def _spinner_glyph(self) -> str:
         return self._SPINNER_FRAMES[self._spinner_frame % len(self._SPINNER_FRAMES)]
 
     def _spinner_gerund(self, m) -> str:
-        # Stable per-message: rotate by message identity hash so the gerund
-        # doesn't strobe with every spinner frame. ID-keyed avoids ChatMessage
-        # __hash__ requirements and survives content mutation.
+        # ID-hashed → stable per-message; survives content mutation.
         idx = (id(m) // 16) % len(self._SPINNER_GERUNDS)
         return self._SPINNER_GERUNDS[idx]
 
@@ -3974,32 +4426,93 @@ class GenericAgentTUI(App[None]):
         return f"{n / 1_000_000.0:.2f}M"
 
     def _spinner_annotation(self, m) -> Text:
-        """Render `⠋ Gerund... (Xm Ys · ↑ N.Nk tokens)` for a streaming message.
-        The gerund hue shifts with elapsed + token deltas (see _gerund_color)."""
+        """Render `⠋ Gerund… (Xm Ys · ↑ N · ↓ M)` for a streaming message.
+        ↑/↓ are the latest LLM call's prompt / completion sizes, gated on
+        cumulative counters moving past the baselines captured at stream start
+        (otherwise the prior turn's tail values leak in on prompt submit).
+        """
         out = Text()
         elapsed = int(time.time() - m._stream_started_at) if m._stream_started_at else 0
-        delta_in = 0
-        try:
-            import cost_tracker
-            sess = self.sessions.get(self.current_id)
-            tname = sess.thread.name if sess and sess.thread else f"ga-tui-agent-{self.current_id}"
-            t = cost_tracker.get(tname)
-            delta_in = max(0, t.input + t.cache_create + t.cache_read - m._stream_baseline_input)
-        except Exception:
-            pass
-        gerund_style = _gerund_color(elapsed, delta_in)
+        last_in, last_out = self._live_call_tokens(m)
+        gerund_style = _gerund_color(elapsed, last_in)
         out.append(self._spinner_glyph(), style=gerund_style)
         out.append(f" {self._spinner_gerund(m)}…", style=gerund_style)
         bits = []
         if m._stream_started_at:
             bits.append(_fmt_elapsed(elapsed))
-        if delta_in > 0:
-            bits.append(f"↑ {self._humanize_tokens(delta_in)} tokens")
+        if last_in > 0 or last_out > 0:
+            bits.append(f"↑ {self._humanize_tokens(last_in)} · ↓ {self._humanize_tokens(last_out)}")
         if bits:
             out.append("  (", style=C_DIM)
             out.append(" · ".join(bits), style=C_DIM)
             out.append(")", style=C_DIM)
         return out
+
+    def _live_call_tokens(self, m) -> tuple:
+        """`(last_in, last_out)` for this turn, gated on cumulative deltas past
+        the per-message baselines. Returns zeros until the new turn moves
+        the counters. Shared by spinner + done-card."""
+        last_in = last_out = 0
+        try:
+            import cost_tracker
+            sess = self.sessions.get(self.current_id)
+            tname = sess.thread.name if sess and sess.thread else f"ga-tui-agent-{self.current_id}"
+            t = cost_tracker.get(tname)
+            cum_in = t.input + t.cache_create + t.cache_read
+            cum_out = t.output
+            if cum_in > m._stream_baseline_input: last_in = t.last_input
+            if cum_out > m._stream_baseline_output: last_out = t.last_output
+        except Exception:
+            pass
+        return last_in, last_out
+
+    # Settled-state braille pairs with the spinner frames (⠋…⠏ → ⠿).
+    _DONE_GLYPH = "⠿"
+
+    # Past-tense pool for the post-turn card; reads "{Verb} for Xm Ys".
+    _DONE_GERUNDS = (
+        "Churned", "Ruminated", "Brewed", "Cooked", "Marinated", "Percolated",
+        "Distilled", "Crystallized", "Synthesized", "Sharpened", "Conjured",
+        "Pondered", "Spelunked", "Untangled", "Foraged", "Hatched", "Pounced",
+        "Sleuthed", "Unraveled", "Calibrated", "Mused", "Schemed", "Tinkered",
+        "Forged", "Simmered", "Steeped",
+        "Threaded", "Folded", "Patched", "Streamed", "Cached", "Hooked",
+        "Routed", "Resolved", "Yielded", "Hydrated", "Reaped", "Tuned",
+        "Plotted", "Reviewed", "Audited", "Verified", "Adjudicated",
+        "Conducted", "Orchestrated",
+        "Mapped", "Reduced", "Dispatched",
+        "Recalled", "Stashed", "Indexed",
+    )
+
+    def _done_gerund(self, m) -> str:
+        # Stable per-message — id-hash so re-mount (theme / resize / fold) keeps
+        # the verb; spinner uses a separate pool so live/settled never collide.
+        idx = (id(m) // 16) % len(self._DONE_GERUNDS)
+        return self._DONE_GERUNDS[idx]
+
+    def _done_annotation(self, m) -> Text:
+        """Render `⠿ {Verb} for Xm Ys · ↑ N · ↓ M` after a turn finishes.
+        Numbers frozen via `_done_summary` so re-mounts / next turn don't
+        shift the line."""
+        elapsed, last_in, last_out = m._done_summary or (0, 0, 0)
+        verb = self._done_gerund(m)
+        out = Text()
+        out.append(self._DONE_GLYPH + " ", style=C_GREEN)
+        out.append(f"{verb} for {_fmt_elapsed(int(elapsed))}", style=C_DIM)
+        if last_in > 0 or last_out > 0:
+            out.append("  · ", style=C_DIM)
+            out.append(f"↑ {self._humanize_tokens(last_in)} · ↓ {self._humanize_tokens(last_out)}",
+                       style=C_DIM)
+        return out
+
+    def _capture_done_summary(self, m) -> None:
+        """Freeze `(elapsed, last_in, last_out)` once when an assistant message
+        transitions done→True. Idempotent — repeat calls are no-ops so re-mounts
+        and stream-update passes won't overwrite the snapshot."""
+        if m._done_summary is not None or not m.done: return
+        elapsed = (time.time() - m._stream_started_at) if m._stream_started_at else 0.0
+        last_in, last_out = self._live_call_tokens(m)
+        m._done_summary = (elapsed, last_in, last_out)
 
     def _has_streaming(self) -> bool:
         if self.current_id is None:
@@ -4032,8 +4545,8 @@ class GenericAgentTUI(App[None]):
 
     def _mark_stream_start(self, m) -> None:
         """Lazily timestamp a streaming message so the spinner can show elapsed/tokens.
-        Snapshots the current input-side token total as a baseline so the displayed
-        delta reflects *this* turn only."""
+        Snapshots both input-side and output-side token totals as baselines so
+        the spinner's `↑ N · ↓ M` reflects *this* turn only."""
         m._stream_started_at = time.time()
         try:
             import cost_tracker
@@ -4041,8 +4554,10 @@ class GenericAgentTUI(App[None]):
             tname = sess.thread.name if sess and sess.thread else f"ga-tui-agent-{self.current_id}"
             t = cost_tracker.get(tname)
             m._stream_baseline_input = t.input + t.cache_create + t.cache_read
+            m._stream_baseline_output = t.output
         except Exception:
             m._stream_baseline_input = 0
+            m._stream_baseline_output = 0
 
     @staticmethod
     def _segment_sig(segs: list[tuple]) -> tuple:
@@ -4082,7 +4597,7 @@ class GenericAgentTUI(App[None]):
             container.mount(m._body_widget)
             return
         if m.role == "user":
-            body = Text(); body.append("> ", style=C_DIM); body.append(m.content, style=C_FG)
+            body = Text(); body.append("> ", style=C_DIM); body.append(_elide_user_display(m.content), style=C_FG)
             for path in m.image_paths:
                 body.append(f"\n📎 {path}", style=C_MUTED)
             m._body_widget = SelectableStatic(body, classes="msg")
@@ -4123,13 +4638,31 @@ class GenericAgentTUI(App[None]):
         self._sync_spinner_widget(container, m, anchor)
 
     def _sync_spinner_widget(self, container, m: ChatMessage, anchor) -> None:
-        """Spinner is a tiny dedicated Static after segment widgets — outside Markdown
-        so unclosed code fences / paragraph trimming can't eat it. Mounted iff streaming."""
+        """Tiny dedicated Static after segment widgets — outside Markdown so
+        unclosed code fences / paragraph trimming can't eat it. While streaming
+        shows the spinner annotation; once `m.done` flips True, the same widget
+        becomes the post-turn `⠿ Churned for Xm Ys` card (frozen via
+        `_capture_done_summary`)."""
         if m.done:
-            if m._spinner_widget is not None:
-                try: m._spinner_widget.remove()
+            # `_stream_started_at` is the marker that this message was actually
+            # streamed in this TUI session. Restored /continue history flips
+            # done=True without ever streaming, so skip the card there — a
+            # "⠿ Churned for 0s" badge under every archived turn is just noise.
+            if m._stream_started_at is None:
+                if m._spinner_widget is not None:
+                    try: m._spinner_widget.remove()
+                    except Exception: pass
+                    m._spinner_widget = None
+                return
+            self._capture_done_summary(m)
+            if m._spinner_widget is None:
+                w = Static(self._done_annotation(m), classes="msg spinner")
+                if anchor is None: container.mount(w)
+                else:               container.mount(w, after=anchor)
+                m._spinner_widget = w
+            else:
+                try: m._spinner_widget.update(self._done_annotation(m))
                 except Exception: pass
-                m._spinner_widget = None
             return
         if m._spinner_widget is None:
             if m._stream_started_at is None:
@@ -4154,9 +4687,13 @@ class GenericAgentTUI(App[None]):
             last_seg = fold_turns(cleaned)[-1]
             last_text = _TURN_MARKER_RE.sub("", last_seg.get("content", ""), count=1)
             last_widget = m._segment_widgets[-1]
-            # During streaming use plain Text — Markdown parse per chunk is O(chunks ×
-            # turn_len). Only on the terminal `done` chunk do we render Markdown once
-            # and swap, restoring code blocks / lists / inline styling and clean-copy.
+            # During streaming use Text.from_ansi — Markdown parse per chunk is
+            # O(chunks × turn_len), but raw Text() would render upstream SGR codes
+            # as literal `[31m` glyphs (visible as ANSI garbage until done flips
+            # True or a resize forces remount). from_ansi is O(n) and resolves
+            # the codes into Rich styles. On the terminal `done` chunk we render
+            # Markdown once and swap, restoring code blocks / lists / inline
+            # styling and clean-copy.
             if m.done:
                 rendered = self._render_md(last_text, width)
                 if isinstance(rendered, _MdRender):
@@ -4166,11 +4703,12 @@ class GenericAgentTUI(App[None]):
                     last_widget.update(rendered)
             else:
                 last_widget._ga_render = None
-                last_widget.update(Text(last_text, style=C_FG))
+                last_widget.update(Text.from_ansi(last_text, style=C_FG))
             if m.done and m._spinner_widget is not None:
-                try: m._spinner_widget.remove()
+                # Convert the live spinner into the post-turn ⠿ card in place.
+                self._capture_done_summary(m)
+                try: m._spinner_widget.update(self._done_annotation(m))
                 except Exception: pass
-                m._spinner_widget = None
             return
         self._remount_assistant_message(m)
 
@@ -4215,8 +4753,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return argparse.ArgumentParser(description="GenericAgent TUI v2 (refined visual style)")
 
 
+def _warn_mintty():
+    """Warn only for direct Git Bash/mintty, not Git Bash inside Windows Terminal."""
+    if sys.platform != 'win32':
+        return
+    # Direct Git Bash uses mintty. Git Bash hosted by Windows Terminal still sets
+    # MSYSTEM, but has WT_SESSION and renders Textual correctly, so do not block it.
+    term_prog = os.environ.get('TERM_PROGRAM', '').lower()
+    wt_session = os.environ.get('WT_SESSION', '')
+    direct_mintty = term_prog == 'mintty' and not wt_session
+    if direct_mintty:
+        print(
+            "\033[33m[ga-tui] WARNING: direct Git Bash/mintty detected.\033[0m\n"
+            "  Textual TUI requires a modern terminal with full VT/xterm support.\n"
+            "  Direct mintty can cause rendering issues (blank screen, garbled output).\n"
+            "\n"
+            "  Recommended alternatives:\n"
+            "    - Windows Terminal Git Bash: wt -p \"Git Bash\" python frontends/tuiapp_v2.py\n"
+            "    - Windows Terminal:          wt python frontends/tuiapp_v2.py\n"
+            "    - CMD:                       python frontends\\tuiapp_v2.py\n"
+            "    - PowerShell:                python frontends/tuiapp_v2.py\n"
+            "\n"
+            "  To continue anyway, set GA_TUI_FORCE=1",
+            file=sys.stderr,
+        )
+        if not os.environ.get('GA_TUI_FORCE'):
+            raise SystemExit(1)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     build_arg_parser().parse_args(argv)
+    _warn_mintty()
     GenericAgentTUI().run()
     return 0
 
