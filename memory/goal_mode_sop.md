@@ -48,3 +48,9 @@ set GOAL_STATE=temp/goal_xxx.json && start /b python agentmain.py --reflect refl
 
 - 状态：读 goal_state.json 的 `turns_used` / `status`
 - 详情：看 `temp/model_responses/` 下最近修改的文件尾部
+
+
+## Goal Hive (多worker协作)
+- Hive = Goal Mode多worker版; 独立运行,不与plan/supervisor/subagent混用
+- 启动: 选空闲PORT+BOARD_KEY → 创建temp/hive_<key>/ → 各worker连同一BBS
+- 数据目录: temp/hive_<BOARD_KEY>/
