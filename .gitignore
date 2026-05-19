@@ -107,6 +107,11 @@ memory/L4_raw_sessions/*
 # Review Mode SOP
 !memory/review_sop.md
 
+# Obsidian Bridge + Writing SOP
+!memory/obsidian_bridge.py
+!memory/obsidian_writing_sop.md
+!memory/memory_search.py
+
 # Visual Studio
 .vs/
 restore_commit.txt
